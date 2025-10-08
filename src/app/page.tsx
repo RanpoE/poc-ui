@@ -63,6 +63,11 @@ const socketBaseUrl = envSocketBase && envSocketBase.length > 0 ? envSocketBase.
 const signalingUrl = `${socketBaseUrl}/ws`;
 const asrUrl = `${socketBaseUrl}/asr`;
 
+type OutgoingSignal =
+    | { type: "offer"; sdp?: RTCSessionDescriptionInit | null }
+    | { type: "answer"; sdp?: RTCSessionDescriptionInit | null }
+    | { type: "ice"; candidate: RTCIceCandidateInit };
+
 export default function Home() {
     const [room, setRoom] = useState<string>("demo");
     const [role, setRole] = useState<Role>("customer");
@@ -89,7 +94,7 @@ export default function Home() {
         });
     }, [muted]);
 
-    const connectSignaling = (): WebSocket => {
+    function connectSignaling(): WebSocket {
         if (wsRef.current) return wsRef.current;
         const ws = new WebSocket(signalingUrl);
         wsRef.current = ws;
@@ -110,7 +115,7 @@ export default function Home() {
                     await pc.setRemoteDescription(msg.sdp);
                     const ans = await pc.createAnswer();
                     await pc.setLocalDescription(ans);
-                    ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription }));
+                    await sendSignal({ type: "answer", sdp: pc.localDescription });
                     break;
                 }
                 case "answer": {
@@ -155,14 +160,54 @@ export default function Home() {
         };
         ws.onclose = () => { setConnected(false); wsRef.current = null; };
         return ws;
-    };
+    }
+
+    async function waitForSocketOpen(ws: WebSocket): Promise<void> {
+        if (ws.readyState === WebSocket.OPEN) return;
+        if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+            throw new Error("WebSocket is not open");
+        }
+        await new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                ws.removeEventListener("open", handleOpen);
+                ws.removeEventListener("error", handleFail);
+                ws.removeEventListener("close", handleFail);
+            };
+            const handleOpen = () => {
+                cleanup();
+                resolve();
+            };
+            const handleFail = () => {
+                cleanup();
+                reject(new Error("WebSocket failed to open"));
+            };
+            ws.addEventListener("open", handleOpen, { once: true });
+            ws.addEventListener("error", handleFail, { once: true });
+            ws.addEventListener("close", handleFail, { once: true });
+        });
+    }
+
+    async function sendSignal(payload: OutgoingSignal): Promise<void> {
+        let ws = wsRef.current;
+        if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+            ws = connectSignaling();
+        }
+        try {
+            await waitForSocketOpen(ws);
+            ws.send(JSON.stringify(payload));
+        } catch (err) {
+            console.warn("Failed to send signaling message", err);
+        }
+    }
 
     async function ensurePC(): Promise<RTCPeerConnection> {
         if (pcRef.current) return pcRef.current;
         const pc = new RTCPeerConnection({ iceServers });
         pcRef.current = pc;
         pc.onicecandidate = (e: RTCPeerConnectionIceEvent) => {
-            if (e.candidate && wsRef.current) wsRef.current.send(JSON.stringify({ type: "ice", candidate: e.candidate }));
+            if (!e.candidate) return;
+            const candidate = typeof e.candidate.toJSON === "function" ? e.candidate.toJSON() : e.candidate;
+            void sendSignal({ type: "ice", candidate });
         };
         pc.ontrack = (e: RTCTrackEvent) => {
             const el = remoteAudioRef.current;
@@ -198,7 +243,7 @@ export default function Home() {
         if (role === "agent") {
             const offer = await pc.createOffer({ offerToReceiveAudio: true });
             await pc.setLocalDescription(offer);
-            wsRef.current?.send(JSON.stringify({ type: "offer", sdp: pc.localDescription }));
+            await sendSignal({ type: "offer", sdp: pc.localDescription });
         }
 
 
